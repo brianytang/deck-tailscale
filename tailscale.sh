@@ -1,134 +1,121 @@
 #!/usr/bin/env bash
+# Install the official static client without unlocking SteamOS's root filesystem.
+set -Eeuo pipefail
+umask 022
 
-# set invocation settings for this script:
-# -e: Exit immediately if a command exits with a non-zero status.
-# -u: Treat unset variables as an error when substituting.
-# -o pipefail: the return value of a pipeline is the status of the last command to exit with a non-zero status, or zero if no command exited with a non-zero status
-set -eu -o pipefail
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die 'Run this installer with sudo bash tailscale.sh.'
+[[ $# -eq 0 ]] || die 'This installer takes no arguments.'
+for command in curl jq tar sha256sum systemctl install stat mktemp readlink; do
+  command -v "$command" >/dev/null || die "Missing required command: $command"
+done
+case "$(uname -m)" in
+  aarch64|arm64) arch=arm64 ;;
+  x86_64|amd64) arch=amd64 ;;
+  *) die 'Only ARM64 (Steam Frame) and x86-64 (Steam Deck) are supported.' ;;
+esac
 
-# save the current directory silently
-pushd . > /dev/null
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+[[ -f "$script_dir/override.conf" ]] || die 'Missing override.conf next to the installer.'
+bin_dir=/var/lib/tailscale-bin
+unit_dir=/etc/systemd/system
+dropin_dir=$unit_dir/tailscaled.service.d
+defaults=/etc/default/tailscaled
+profile=/etc/profile.d/tailscale.sh
+keep=/etc/atomic-update.conf.d/tailscale.conf
 
-# make a temporary directory, save the name, and move into it
-dir="$(mktemp -d)"
-cd "${dir}"
-
-echo -n "Getting version..."
-
-# get info for the latest version of Tailscale
-tarball="$(curl -s 'https://pkgs.tailscale.com/stable/?mode=json' | jq -r .Tarballs.amd64)"
-version="$(echo ${tarball} | cut -d_ -f2)"
-
-echo "got ${version}."
-
-echo "Downloading:"
-
-# download the Tailscale package itself
-wget -q --show-progress -O tailscale.tgz "https://pkgs.tailscale.com/stable/${tarball}"
-
-echo -n "Removing Legacy Installations..."
-
-# Stop and disable the systemd service
-if systemctl is-active --quiet tailscaled; then
-  systemctl stop tailscaled &>/dev/null || echo "ERROR: could not stop tailscaled"
+# A privileged daemon must never execute files replaceable by the login user.
+# Check ancestors before mkdir/install, and refuse symlinked configuration targets.
+secure_directory() {
+  local path=$1 owner mode
+  [[ ! -L "$path" ]] || die "Refusing symlinked directory: $path"
+  if [[ -e "$path" ]]; then
+    [[ -d "$path" ]] || die "Not a directory: $path"
+    owner=$(stat -c %u -- "$path")
+    mode=$(stat -c %a -- "$path")
+    [[ $owner == 0 ]] && (( (8#$mode & 0022) == 0 )) || die "Directory must be root-owned and not group/other writable: $path"
+  else
+    install -d -o root -g root -m 0755 -- "$path"
+  fi
+}
+for path in /var /var/lib "$bin_dir" "$bin_dir/releases" /etc /etc/systemd "$unit_dir" "$dropin_dir" /etc/default /etc/profile.d /etc/atomic-update.conf.d; do
+  secure_directory "$path"
+done
+for path in "$defaults" "$profile" "$keep" "$unit_dir/tailscaled.service" "$dropin_dir/10-steamos.conf"; do
+  [[ ! -L "$path" ]] || die "Refusing symlinked file: $path"
+done
+if [[ -e "$dropin_dir/override.conf" ]]; then
+  die 'An older override.conf exists. Back it up outside tailscaled.service.d and remove it before installing; see readme.md.'
 fi
-if systemctl is-enabled --quiet tailscaled; then
-  systemctl disable tailscaled &>/dev/null || echo "ERROR: could not disable tailscaled"
+[[ ! -e "$bin_dir/current" || -L "$bin_dir/current" ]] || die "$bin_dir/current must be a symlink."
+
+tmp=$(mktemp -d)
+release=
+cleanup() {
+  rm -rf -- "$tmp"
+  # A failed download/validation must not leave a half-installed release.
+  if [[ -n $release && -d $release ]] && [[ $(readlink "$bin_dir/current" 2>/dev/null || true) != "releases/${release##*/}" ]]; then
+    rm -rf -- "$release"
+  fi
+}
+trap cleanup EXIT
+trap 'printf "Installation failed (line %s). Existing login state is preserved.\n" "$LINENO" >&2' ERR
+fetch() { curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 20 --max-time 300 "$@"; }
+
+printf 'Looking up the latest stable %s release...\n' "$arch"
+fetch 'https://pkgs.tailscale.com/stable/?mode=json' > "$tmp/metadata.json"
+tarball=$(jq -er --arg arch "$arch" '.Tarballs[$arch] | strings' "$tmp/metadata.json")
+[[ $tarball =~ ^tailscale_([0-9]+\.[0-9]+\.[0-9]+)_${arch}\.tgz$ ]] || die "Unexpected archive name: $tarball"
+version=${BASH_REMATCH[1]}
+fetch "https://pkgs.tailscale.com/stable/$tarball" -o "$tmp/tailscale.tgz"
+fetch "https://pkgs.tailscale.com/stable/$tarball.sha256" -o "$tmp/checksum"
+read -r checksum _ < "$tmp/checksum"
+[[ $checksum =~ ^[a-fA-F0-9]{64}$ ]] || die 'Invalid SHA-256 response.'
+printf '%s  %s\n' "$checksum" "$tmp/tailscale.tgz" | sha256sum --check --status || die 'Archive checksum mismatch; existing service was not stopped.'
+
+archive_dir=${tarball%.tgz}
+# Extract only expected members; do not unpack arbitrary paths from an archive.
+tar -xzf "$tmp/tailscale.tgz" -C "$tmp" --no-same-owner --no-same-permissions -- \
+  "$archive_dir/tailscale" "$archive_dir/tailscaled" \
+  "$archive_dir/systemd/tailscaled.service" "$archive_dir/systemd/tailscaled.defaults"
+for member in tailscale tailscaled systemd/tailscaled.service systemd/tailscaled.defaults; do
+  [[ -f "$tmp/$archive_dir/$member" && ! -L "$tmp/$archive_dir/$member" ]] || die "Missing or symlinked archive member: $member"
+done
+release=$(mktemp -d "$bin_dir/releases/release.XXXXXX")
+chmod 0755 "$release"
+install -o root -g root -m 0755 "$tmp/$archive_dir/tailscale" "$tmp/$archive_dir/tailscaled" "$release/"
+printf '%s\n' "$version" > "$release/VERSION"
+
+# Keep administrator settings, including an existing device's login state.
+if [[ ! -e $defaults ]]; then
+  install -o root -g root -m 0644 "$tmp/$archive_dir/systemd/tailscaled.defaults" "$defaults"
 fi
-
-# Remove the systemd system extension
-if [ $(systemd-sysext list 2>/dev/null | grep -c "/var/lib/extensions/tailscale") -ne 0 ]; then
-  systemd-sysext unmerge &>/dev/null || echo "ERROR: could not unmerge system extensions"
-  rm -rf /var/lib/extensions/tailscale
-  systemd-sysext merge &>/dev/null || echo "ERROR: could not merge system extensions"
-fi
-
-echo "done."
-
-echo -n "Installing..."
-
-# extract the tailscale binaries
-tar xzf tailscale.tgz
-tar_dir="$(echo ${tarball} | cut -d. -f1-3)"
-test -d $tar_dir
-
-# Create binaries directory in home
-mkdir -p /opt/tailscale
-
-# pull binaries
-cp -rf $tar_dir/tailscale /opt/tailscale/tailscale
-cp -rf $tar_dir/tailscaled /opt/tailscale/tailscaled
-
-# add binaries to path via profile.d
-if ! test -f /etc/profile.d/tailscale.sh; then
-  echo 'PATH="$PATH:/opt/tailscale"' >> /etc/profile.d/tailscale.sh
-  source /etc/profile.d/tailscale.sh
-fi
-
-# copy the systemd file into place
-cp -rf $tar_dir/systemd/tailscaled.service /etc/systemd/system/tailscaled.service
-
-# copy in the defaults file if it doesn't already exist
-if ! test -f /etc/default/tailscaled; then
-  cp -rf $tar_dir/systemd/tailscaled.defaults /etc/default/tailscaled
-fi
-
-# add atomic-update.conf.d configuration
-cat <<EOF > /etc/atomic-update.conf.d/tailscale.conf
+install -o root -g root -m 0644 "$tmp/$archive_dir/systemd/tailscaled.service" "$unit_dir/tailscaled.service"
+install -o root -g root -m 0644 "$script_dir/override.conf" "$dropin_dir/10-steamos.conf"
+printf 'export PATH="$PATH:/var/lib/tailscale-bin/current"\n' > "$profile"
+chmod 0644 "$profile"
+cat > "$keep" <<'EOF'
 /etc/default/tailscaled
 /etc/profile.d/tailscale.sh
+/etc/systemd/system/tailscaled.service
+/etc/systemd/system/tailscaled.service.d/10-steamos.conf
+/etc/systemd/system/multi-user.target.wants/tailscaled.service
 EOF
+chmod 0644 "$keep"
 
-# return to our original directory (silently) and clean up
-popd > /dev/null
-rm -rf "${dir}"
-
-# if an override file already exists, back up and remove
-if test -f /etc/systemd/system/tailscaled.service.d/override.conf; then
-  echo
-  echo
-  echo "Warning: An existing Tailscaled systemd override file was detected. It must be replaced."
-  echo "A backup of the existing file is being placed at /etc/systemd/system/tailscaled.service.d/override.conf.bak"
-  echo
-  cp -f /etc/systemd/system/tailscaled.service.d/override.conf /etc/systemd/system/tailscaled.service.d/override.conf.bak
-  rm /etc/systemd/system/tailscaled.service.d/override.conf
-fi
-
-# copy our override file in
-mkdir -p /etc/systemd/system/tailscaled.service.d
-cp -f override.conf /etc/systemd/system/tailscaled.service.d/override.conf
-
-# capture the above override file in systemd
+# Download and stage first. Switch the entire binary pair atomically while stopped.
+# Run this over local SSH: stopping Tailscale disconnects sessions using it.
 systemctl daemon-reload
-
-echo "done."
-
-echo -n "Starting required services..."
-
-# tailscaled - the tailscale daemon
-# Note: enable and start/restart must be run because the legacy installation stops and disables
-# any existing installations.
-systemctl enable tailscaled &>/dev/null || echo "ERROR: Could not enable tailscaled service"
 if systemctl is-active --quiet tailscaled; then
-  echo "Upgrade complete."
-  echo -n "Restarting tailscaled..."
-else
-  echo "Install complete."
-  echo -n "Starting tailscaled..."
+  systemctl stop tailscaled
 fi
+ln -s "releases/${release##*/}" "$bin_dir/.current.$$"
+mv -Tf -- "$bin_dir/.current.$$" "$bin_dir/current"
+systemctl enable tailscaled
+systemctl restart tailscaled
+systemctl is-active --quiet tailscaled || die 'tailscaled did not become active; inspect journalctl -u tailscaled.'
 
-# This needs to be the last thing we do in case the user's running this over Tailscale SSH.
-systemctl restart tailscaled &>/dev/null || echo "ERROR: Could not start tailscaled service"
-
-echo "done."
-
-if ! command -v tailscale &> /dev/null; then
-  echo
-  echo "Tailscale is installed and running but the binaries are not in your path yet."
-  echo "Restart your session or run the following command to add them:"
-  echo
-  echo "source /etc/profile.d/tailscale.sh"
-  echo
-fi
-
-echo "Installation Complete."
+printf 'Installed Tailscale %s (%s).\n' "$version" "$arch"
+printf 'Load the CLI with: source /etc/profile.d/tailscale.sh\n'
+printf 'Then connect with: sudo /var/lib/tailscale-bin/current/tailscale up --operator=<your-login-user>\n'
+printf 'Installation does not authenticate the device. Check tailscale status after browser login.\n'
