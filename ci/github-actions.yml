@@ -1,0 +1,19 @@
+name: Test installer
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax and lint
+        run: |
+          for script in tailscale.sh uninstall.sh lib/*.sh tests/test-install.sh; do
+            bash -n "$script"
+          done
+          shellcheck -x -P SCRIPTDIR tailscale.sh uninstall.sh lib/*.sh tests/test-install.sh
+      - name: Run offline non-root integration tests
+        run: bash tests/test-install.sh

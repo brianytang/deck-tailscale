@@ -1,77 +1,136 @@
-# Tailscale on the Steam Deck
+# Tailscale on Steam Frame and Steam Deck
 
-## Installing Tailscale
+A community installer for the official native Linux Tailscale client on immutable
+SteamOS. Steam Frame uses ARM64; Steam Deck uses x86-64. The installer keeps the
+root filesystem locked and runs the normal system-wide Tailscale service.
 
-1. Clone this repo to your Deck, switch to root and enter the directory:
-   1. `git clone https://github.com/tailscale-dev/deck-tailscale.git ~/deck-tailscale`
-   2. `sudo -i`
-   3. `cd ~deck/deck-tailscale` 
-2. Run `bash tailscale.sh` to install Tailscale (or update the existing
-   installation).
-3. Run `source /etc/profile.d/tailscale.sh` to put the binaries in your path
-4. Run `tailscale up --qr --operator=deck --ssh` to have Tailscale generate
-   a login QR code. Scan the code with your phone and authenticate with
-   Tailscale to bring your Deck onto your network.
-5. Run `exit` to return to your normal user shell once you're done.
+## Install on Steam Frame
 
-## Updating Tailscale
+Enable Developer Mode and set a user password in the headset settings. Connect
+from a PC using your paired Devkit SSH key, or open a terminal on the headset.
+Run these commands **on the Frame**, as `steamos`:
 
-Tailscale should be able to update itself now!
-
-If you are still in the root shell from the installation steps above, run:
 ```bash
-tailscale update
-tailscale set --auto-update
+git clone https://github.com/brianytang/deck-tailscale.git ~/deck-tailscale
+sudo bash ~/deck-tailscale/tailscale.sh
+source /etc/profile.d/tailscale.sh
+sudo /home/.tailscale-bin/current/tailscale up --operator=steamos
 ```
 
-If you are running as the standard `deck` user, `sudo` will not find `tailscale` directly because `/opt/tailscale` is not in `sudo`'s default `secure_path`. Use the full binary path for the update:
+Open the printed login URL on any device and sign in to your Tailscale account.
+Installing the service does not authenticate the headset. Install Tailscale on
+any PC/server you want to reach and join the same tailnet.
+
+On Steam Deck, use the same installation commands and `--operator=deck` for login.
+Tailscale SSH is optional: the existing OpenSSH server works over the Tailscale IP.
+The installer does not enable SSH, routing, exit nodes, or automatic client updates.
+
+Requirements: internet, sudo, Bash, systemd, kernel TUN support, `curl`, `jq`,
+`tar`, `sha256sum`, `flock`, and standard coreutils. The expected `/home`, `/var`,
+and `/etc` directories must be writable where files are installed, root-owned,
+and not writable by other users. Symlinked ancestors/configuration are refused.
+
+## Verify
+
 ```bash
-sudo /opt/tailscale/tailscale update
-tailscale set --auto-update
+systemctl is-active tailscaled
+systemctl is-enabled tailscaled
+tailscale status
+tailscale ip -4
+tailscale status --json | jq '{BackendState, Health}'
+tailscale ping YOUR_OTHER_DEVICE
+journalctl -u tailscaled -n 60 --no-pager
 ```
-*(Note: `--operator=deck` was configured during installation, so `tailscale set` can be run without `sudo`.)*
 
-If it doesn't work, keep reading.
+After browser login, expect `active`, `enabled`, `BackendState: Running`, and no
+health warnings. Check that a Tailscale peer can reach the Frame and that the
+Frame can reach the intended service. `tailscale ping` shows whether the link is
+direct or relayed. Installation alone does not establish app compatibility or
+acceptable VR streaming latency.
 
-> ⚠️ This process will most likely fail if you are accessing the terminal over
-> Tailscale SSH, as it seems to be locked in a chroot jail. You should start and
-> connect through the standard SSH server instead, but remember to stop it when
-> you're done.
-> [Suggestions for how to fix this are welcomed.](https://github.com/tailscale-dev/deck-tailscale/issues/2)
+## Update
 
-## Updating the install script
+Use a local terminal or local-network SSH; restarting the daemon disconnects
+sessions carried by Tailscale.
 
-To benefit from improvements to the install script, consider rerunning it from time to time.
+```bash
+cd ~/deck-tailscale
+git pull --ff-only
+sudo bash tailscale.sh
+```
 
-1. Git fetch and pull to make sure you're up to date (from the standard `deck` user):
-   1. `cd ~/deck-tailscale`
-   2. `git pull`
-2. Run `sudo bash tailscale.sh` again.
+The installer downloads the latest stable native archive, verifies its SHA-256
+sidecar, extracts only the expected files, and checks both executable versions
+before stopping the old service. It then publishes the binary pair together. If
+configuration, enablement, or startup fails, it restores the prior selector,
+managed configuration, and previous active/enabled service state. Rollback
+failures are reported. A lock prevents concurrent install/uninstall operations.
+Older successful releases remain available under `/home/.tailscale-bin/releases`.
+Existing defaults, login identity, and other systemd drop-ins are preserved.
 
-This process overwrites the existing binaries and service file, so it's not
-recommended to tweak those files directly. The configuration file at
-`/etc/default/tailscaled` is left alone. The configuration file at
-`/etc/systemd/system/tailscaled.service.d/override.conf` is reset every time this script is run to ensure the path to the binary is correct, but the preexisting file will be backed up in that directory as `override.conf.bak`. If something goes wrong, copy those files somewhere else and re-run the install script to get back to a working state.
+Use this installer for updates. Built-in `tailscale update` would modify a selected
+release in place, bypassing this transaction, and Tailscale's automatic updater
+cannot discover the CLI at our custom location. Do not enable automatic updates
+for this installation.
 
-## Uninstalling Tailscale
+## Uninstall
 
-1. `cd ~/deck-tailscale`
-2. Run `sudo bash uninstall.sh`
+```bash
+sudo bash ~/deck-tailscale/uninstall.sh
+```
 
-## Common issues
+This removes only an installation bearing this fork's ownership marker. It stops
+and disables the service, removes our binaries and generated files, and keeps
+`/var/lib/tailscale` and custom systemd drop-ins. A defaults file that predated our
+installation is retained. Reinstalling can reuse the device identity. The device
+entry in the Tailscale admin console is not deleted. Repeated uninstall is safe.
 
-### Broken config file
+## Existing installations
 
-Symptom: `invalid value "" for flag -port: can't be the empty string`
+An unmanaged unit (including a package/vendor unit), a legacy `override.conf`, or
+unmanaged profile/keep fragment causes installation to stop with an explanation.
+The installer does not remove another installation or unmerge system extensions.
+Before migrating, inspect and back up its configuration, stop it through its own
+installer, and remove the conflicting managed configuration. Preserve the device
+state in `/var/lib/tailscale` if you want to keep the same identity. Never run an
+uninstaller blindly against a different installation.
 
-Resolution: Delete `/etc/default/tailscaled` and re-run installer script.
+## Layout and firewall
 
-## How it works
+| Component | Location |
+| --- | --- |
+| Root-controlled binaries and release selector | `/home/.tailscale-bin` |
+| Private daemon state | `/var/lib/tailscale` (0700) |
+| Runtime socket | `/run/tailscale/tailscaled.sock` |
+| Official unit plus our executable override | `/etc/systemd/system/tailscaled.service`, `tailscaled.service.d/10-steamos.conf` |
+| Preserved daemon settings | `/etc/default/tailscaled` |
+| CLI PATH | `/etc/profile.d/tailscale.sh` |
+| SteamOS retention fragment | `/etc/atomic-update.conf.d/tailscale.conf` |
 
-This script is derived from the [original guide](https://tailscale.com/blog/steam-deck), but has been
-tweaked to make the process smoother and produce an installation that comes up
-automatically on boot (no need to enter desktop mode).
+Frame defaults to `TS_DEBUG_FIREWALL_MODE=nftables`, informed by the comparison
+fork's observed legacy iptables failure and working nftables fix. Deck defaults
+to `auto`. An explicit value in `/etc/default/tailscaled` overrides the fallback.
+Look for `router: ... using nftables` in the journal after login. This Tailscale
+knob is documented as temporary; revisit it when upgrading the client. It keeps
+Tailscale firewall management enabled and does not flush existing rules.
 
-The Tailscale binaries `tailscale` and `tailscaled` are installed in `/opt/tailscale/`. The Tailscale systemd unit file is installed at `/etc/systemd/system/tailscale.service`. The override file to reconfigure the services `Exec` commands is installed at `/etc/systemd/system/tailscaled.service.d/override.conf`. The defaults file for the variables `PORT` and `FLAGS` is installed at `/etc/default/tailscaled`
+The retention fragment names our unit, override, enablement, defaults, profile,
+and itself. Hardware inspection confirms that the current Frame's SteamOS keep
+list supports these entries. Actual reboot and OS-update survival are separate
+validation steps; an update may still require rerunning the installer.
 
-The service is then started and enabled via `systemctl`.
+## Validation and design decision
+
+See [the decision record](docs/steam-frame-decision.md) for the independent
+proposal, comparison/debate, hardware findings, exact revisions, and validation
+limits. Offline tests run scripts as an ordinary user against confined temporary
+filesystem copies with mocked network/systemd/ownership and real archives,
+checksums, and file operations:
+
+```bash
+bash tests/test-install.sh
+```
+
+These tests do not prove real hardware connectivity, reboot behavior, or SteamOS
+upgrade survival. The original upstream is
+[tailscale-dev/deck-tailscale](https://github.com/tailscale-dev/deck-tailscale).
